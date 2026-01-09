@@ -1,7 +1,8 @@
 """Security analyzer domain service."""
 
-from typing import List
+from typing import List, Optional, Callable
 import json
+import re
 import time
 from ..models.security import SecurityFinding, Severity, FindingConfidence
 from ..models.prompt import PromptContext
@@ -32,6 +33,8 @@ class SecurityAnalyzer:
         self,
         context: PromptContext,
         system_prompt: str,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        finding_callback: Optional[Callable[[SecurityFinding], None]] = None,
     ) -> List[SecurityFinding]:
         """
         Analyze code for security vulnerabilities using AI.
@@ -42,6 +45,7 @@ class SecurityAnalyzer:
         Args:
             context: Code context with metadata
             system_prompt: Instructions for the AI
+            stream_callback: Optional callback to receive streaming tokens
 
         Returns:
             List of security findings identified by AI
@@ -62,14 +66,75 @@ class SecurityAnalyzer:
         )
 
         try:
-            # Get AI analysis
+            # Accumulate response for incremental parsing
+            accumulated_response = []
+            parsed_findings = []
+            parsed_findings_signatures = set()  # Track by signature to avoid duplicates
+            
+            # Create a wrapper callback that accumulates tokens and tries to parse findings incrementally
+            def incremental_stream_callback(token: str):
+                """Callback that accumulates tokens and parses findings as they appear."""
+                accumulated_response.append(token)
+                
+                # Call the original stream callback if provided
+                if stream_callback:
+                    stream_callback(token)
+                
+                # Try to parse findings from accumulated response
+                # Check when we see closing braces (complete objects) or periodically
+                should_check = (
+                    finding_callback and (
+                        token.strip().endswith('}') or  # Likely end of an object
+                        token.strip().endswith(']') or  # Likely end of an array
+                        len(accumulated_response) % 5 == 0  # Or every 5 tokens
+                    )
+                )
+                
+                if should_check:
+                    try:
+                        # Get current accumulated text
+                        current_text = ''.join(accumulated_response)
+                        
+                        # Try to extract and parse complete findings
+                        incremental_findings = self._parse_findings_incremental(
+                            current_text,
+                            context.file_path,
+                            already_parsed=parsed_findings
+                        )
+                        
+                        # Call callback for new findings
+                        for finding in incremental_findings:
+                            # Create signature to check for duplicates
+                            finding_sig = (finding.issue, finding.file_path, finding.severity.value)
+                            if finding_sig not in parsed_findings_signatures:
+                                parsed_findings_signatures.add(finding_sig)
+                                parsed_findings.append(finding)
+                                finding_callback(finding)
+                    except Exception:
+                        # If parsing fails, continue accumulating (not a complete finding yet)
+                        pass
+            
+            # Get AI analysis with incremental parsing callback
             raw_response = await self.llm_service.analyze_code_security(
                 context=context,
                 system_prompt=system_prompt,
+                stream_callback=incremental_stream_callback if finding_callback else stream_callback,
             )
 
-            # Parse AI response into findings
-            findings = self._parse_findings(raw_response, context.file_path)
+            # Parse AI response into findings (final parse to catch any missed findings)
+            all_findings = self._parse_findings(raw_response, context.file_path)
+            
+            # Add any findings that weren't caught incrementally
+            if finding_callback:
+                for finding in all_findings:
+                    finding_sig = (finding.issue, finding.file_path, finding.severity.value)
+                    if finding_sig not in parsed_findings_signatures:
+                        parsed_findings_signatures.add(finding_sig)
+                        parsed_findings.append(finding)
+                        finding_callback(finding)
+                findings = parsed_findings
+            else:
+                findings = all_findings
             
             # Enhance findings with line numbers and context
             findings = self._enhance_findings_with_context(findings, context)
@@ -185,6 +250,175 @@ class SecurityAnalyzer:
         # Parse validated findings
         validated = self._parse_findings(validated_response, context.file_path)
         return validated
+
+    def _parse_findings_incremental(
+        self,
+        partial_response: str,
+        file_path: str,
+        already_parsed: List[SecurityFinding],
+    ) -> List[SecurityFinding]:
+        """
+        Parse findings incrementally from partial response.
+        
+        Tries to extract complete finding objects from the stream as they appear.
+        Looks for complete JSON objects that represent findings, even if they're
+        inside an incomplete parent structure.
+        
+        Args:
+            partial_response: Partial JSON response from stream
+            file_path: File being analyzed
+            already_parsed: List of findings already parsed (to avoid duplicates)
+            
+        Returns:
+            List of newly parsed findings
+        """
+        new_findings = []
+        
+        try:
+            # Track positions we've already checked to avoid re-parsing
+            checked_positions = set()
+            
+            # Find all complete JSON objects in the response
+            # This handles objects that are complete even if parent structure isn't
+            i = 0
+            while i < len(partial_response):
+                if partial_response[i] == '{':
+                    # Found start of an object, try to find its end
+                    brace_count = 0
+                    start_idx = i
+                    in_string = False
+                    escape_next = False
+                    
+                    for j in range(i, len(partial_response)):
+                        char = partial_response[j]
+                        
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                            continue
+                        
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    # Found complete object
+                                    obj_str = partial_response[start_idx:j+1]
+                                    
+                                    # Skip if we've already checked this position
+                                    if start_idx in checked_positions:
+                                        i = j + 1
+                                        break
+                                    
+                                    checked_positions.add(start_idx)
+                                    
+                                    # Try to parse as JSON
+                                    try:
+                                        obj = json.loads(obj_str)
+                                        
+                                        # Check if this is a finding object (has "issue" field)
+                                        if "issue" in obj:
+                                            finding = self._create_finding_from_dict(obj, file_path)
+                                            if finding:
+                                                # Check if we've already parsed this finding
+                                                # by comparing key attributes
+                                                is_duplicate = any(
+                                                    f.issue == finding.issue and 
+                                                    f.file_path == finding.file_path and
+                                                    f.severity == finding.severity
+                                                    for f in already_parsed
+                                                )
+                                                if not is_duplicate:
+                                                    new_findings.append(finding)
+                                        
+                                        # Also check if this is a wrapper object with "reviews" array
+                                        elif "reviews" in obj and isinstance(obj.get("reviews"), list):
+                                            for review in obj["reviews"]:
+                                                finding = self._create_finding_from_dict(review, file_path)
+                                                if finding:
+                                                    is_duplicate = any(
+                                                        f.issue == finding.issue and 
+                                                        f.file_path == finding.file_path and
+                                                        f.severity == finding.severity
+                                                        for f in already_parsed
+                                                    )
+                                                    if not is_duplicate:
+                                                        new_findings.append(finding)
+                                    except (json.JSONDecodeError, Exception):
+                                        # Not valid JSON or not a finding, continue
+                                        pass
+                                    
+                                    i = j + 1
+                                    break
+                    else:
+                        # Didn't find closing brace, move on
+                        i += 1
+                else:
+                    i += 1
+            
+            # Also try to parse complete arrays of findings
+            try:
+                # Look for patterns like [{"issue": ...}, {"issue": ...}]
+                # Find arrays that might contain findings
+                bracket_positions = []
+                for i, char in enumerate(partial_response):
+                    if char == '[':
+                        bracket_positions.append(i)
+                    elif char == ']' and bracket_positions:
+                        start = bracket_positions.pop()
+                        try:
+                            array_str = partial_response[start:i+1]
+                            array_data = json.loads(array_str)
+                            if isinstance(array_data, list):
+                                for item in array_data:
+                                    if isinstance(item, dict) and "issue" in item:
+                                        finding = self._create_finding_from_dict(item, file_path)
+                                        if finding:
+                                            is_duplicate = any(
+                                                f.issue == finding.issue and 
+                                                f.file_path == finding.file_path and
+                                                f.severity == finding.severity
+                                                for f in already_parsed
+                                            )
+                                            if not is_duplicate:
+                                                new_findings.append(finding)
+                        except (json.JSONDecodeError, Exception):
+                            pass
+            except Exception:
+                pass
+                
+        except Exception:
+            # If incremental parsing fails, return empty list (will parse at end)
+            pass
+        
+        return new_findings
+    
+    def _create_finding_from_dict(self, data: dict, file_path: str) -> Optional[SecurityFinding]:
+        """Create a SecurityFinding from a dictionary."""
+        try:
+            return SecurityFinding.create(
+                issue=data.get("issue", "Unknown issue"),
+                reasoning=data.get("reasoning", ""),
+                mitigation=data.get("mitigation", ""),
+                severity=self._parse_severity(data.get("severity", "medium")),
+                confidence=self._parse_confidence(data.get("confidence", 0.7)),
+                file_path=file_path,
+                code_snippet=data.get("code_snippet", ""),
+                line_start=data.get("line_start"),
+                line_end=data.get("line_end"),
+                cwe_id=data.get("cwe_id"),
+                tags=data.get("tags", []),
+            )
+        except Exception:
+            return None
 
     def _parse_findings(
         self,
